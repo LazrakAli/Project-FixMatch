@@ -1,0 +1,22 @@
+Le plan consiste à
+    - comprendre l’algorithme
+    - lancer des expériences
+    - modifier certains paramètres ou méthodes
+    - analyser les résultats
+
+
+Piste donner par le prof:
+    try other semi-supervised learning strategies
+    mean teacher
+    mean predictions
+    cut-mix
+    active learning
+
+Avant tout definissons certains terme:
+    qu'est ce que semi-supervised:
+        utilisation de supervisé et non supervise afin d'entrainer notre modele:
+        ainsi nous avons peu de données annotées + beaucoup de données non annotées
+
+    qu'est ce que fixmatch:
+    si un modele est sur de ca predictions il peut l'utiliser comme label
+    exemple une image n'as pas de label, le modele juge 97% chat , 2% chien, 1% autre on peut l'utiliser comme étant chat ainsi c'est un pseudo label
