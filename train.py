@@ -375,9 +375,11 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 if args.world_size > 1:
                     unlabeled_epoch += 1
                     unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
-
                 unlabeled_iter = iter(unlabeled_trainloader)
                 (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
+
+            inputs_u_w = inputs_u_w.to(args.device)
+            inputs_u_s = inputs_u_s.to(args.device)
 
             data_time.update(time.time() - end)
 
