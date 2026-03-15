@@ -297,24 +297,21 @@ def main():
     model.zero_grad()
     train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
           model, optimizer, ema_model, scheduler)
-    
+
 def cutmix(images, labels, alpha=1.0):
     lam = np.random.beta(alpha, alpha)
     batch_size = images.size(0)
+
     index = torch.randperm(batch_size).to(images.device)
 
     mixed_images = lam * images + (1 - lam) * images[index]
+
     labels_a = labels
     labels_b = labels[index]
 
     return mixed_images, labels_a, labels_b, lam
-
 def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
           model, optimizer, ema_model, scheduler):
-
-    if args.amp:
-        from apex import amp
-
     global best_acc
     test_accs = []
     end = time.time()
@@ -329,20 +326,16 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
     unlabeled_iter = iter(unlabeled_trainloader)
 
     model.train()
-
     for epoch in range(args.start_epoch, args.epochs):
-
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
         losses_x = AverageMeter()
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
-
         if not args.no_progress:
             p_bar = tqdm(range(args.eval_step),
                          disable=args.local_rank not in [-1, 0])
-
         for batch_idx in range(args.eval_step):
             try:
                 inputs_x, targets_x = next(labeled_iter)
@@ -350,24 +343,12 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 if args.world_size > 1:
                     labeled_epoch += 1
                     labeled_trainloader.sampler.set_epoch(labeled_epoch)
-
                 labeled_iter = iter(labeled_trainloader)
                 inputs_x, targets_x = next(labeled_iter)
 
-            inputs_x = inputs_x.to(args.device)
-            targets_x = targets_x.to(args.device)
-
-            # ----------------------------
-            # CUTMIX
-            # ----------------------------
+            # Apply CutMix after getting the labeled batch
             if args.cutmix:
-                lam = np.random.beta(1.0, 1.0)
-                index = torch.randperm(inputs_x.size(0)).to(args.device)
-
-                inputs_x = lam * inputs_x + (1 - lam) * inputs_x[index]
-
-                targets_a = targets_x
-                targets_b = targets_x[index]
+                inputs_x, targets_a, targets_b, lam = cutmix(inputs_x, targets_x)
 
             try:
                 (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
@@ -378,92 +359,112 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
                 unlabeled_iter = iter(unlabeled_trainloader)
                 (inputs_u_w, inputs_u_s), _ = next(unlabeled_iter)
 
+            data_time.update(time.time() - end)
+            batch_size = inputs_x.shape[0]
+            inputs_x = inputs_x.to(args.device)
             inputs_u_w = inputs_u_w.to(args.device)
             inputs_u_s = inputs_u_s.to(args.device)
 
-            data_time.update(time.time() - end)
-
-            batch_size = inputs_x.shape[0]
-
             inputs = interleave(
-                torch.cat((inputs_x, inputs_u_w, inputs_u_s)),
-                2 * args.mu + 1
-            ).to(args.device)
-
+                torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2*args.mu+1)
+            targets_x = targets_x.to(args.device)
             logits = model(inputs)
-
-            logits = de_interleave(logits, 2 * args.mu + 1)
-
+            logits = de_interleave(logits, 2*args.mu+1)
             logits_x = logits[:batch_size]
             logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-
             del logits
 
+            # Supervised loss, with CutMix if enabled
             if args.cutmix:
+                targets_a = targets_a.to(args.device)
+                targets_b = targets_b.to(args.device)
                 Lx = lam * F.cross_entropy(logits_x, targets_a, reduction='mean') + \
                      (1 - lam) * F.cross_entropy(logits_x, targets_b, reduction='mean')
             else:
                 Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
 
-            pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
-
+            pseudo_label = torch.softmax(logits_u_w.detach()/args.T, dim=-1)
             max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-
             mask = max_probs.ge(args.threshold).float()
 
-            Lu = (F.cross_entropy(
-                logits_u_s,
-                targets_u,
-                reduction='none'
-            ) * mask).mean()
+            Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                 reduction='none') * mask).mean()
 
             loss = Lx + args.lambda_u * Lu
-            if args.amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+
+            loss.backward()
 
             losses.update(loss.item())
             losses_x.update(Lx.item())
             losses_u.update(Lu.item())
-
             optimizer.step()
             scheduler.step()
-
             if args.use_ema:
                 ema_model.update(model)
-
             model.zero_grad()
 
             batch_time.update(time.time() - end)
             end = time.time()
-
             mask_probs.update(mask.mean().item())
-
             if not args.no_progress:
-                p_bar.set_description(
-                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. "
-                    "LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. "
-                    "Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. "
-                    "Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
-                        epoch=epoch + 1,
-                        epochs=args.epochs,
-                        batch=batch_idx + 1,
-                        iter=args.eval_step,
-                        lr=scheduler.get_last_lr()[0],
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        loss=losses.avg,
-                        loss_x=losses_x.avg,
-                        loss_u=losses_u.avg,
-                        mask=mask_probs.avg
-                    )
-                )
+                p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                    epoch=epoch + 1,
+                    epochs=args.epochs,
+                    batch=batch_idx + 1,
+                    iter=args.eval_step,
+                    lr=scheduler.get_last_lr()[0],
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    loss=losses.avg,
+                    loss_x=losses_x.avg,
+                    loss_u=losses_u.avg,
+                    mask=mask_probs.avg))
                 p_bar.update()
 
         if not args.no_progress:
             p_bar.close()
+
+        if args.use_ema:
+            test_model = ema_model.ema
+        else:
+            test_model = model
+
+        if args.local_rank in [-1, 0]:
+            test_loss, test_acc = test(args, test_loader, test_model, epoch)
+
+            args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+            args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+            args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+            args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+            args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+            args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+
+            is_best = test_acc > best_acc
+            best_acc = max(test_acc, best_acc)
+
+            model_to_save = model.module if hasattr(model, "module") else model
+            if args.use_ema:
+                ema_to_save = ema_model.ema.module if hasattr(
+                    ema_model.ema, "module") else ema_model.ema
+            else:
+                ema_to_save = None
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model_to_save.state_dict(),
+                'ema_state_dict': ema_to_save.state_dict() if ema_to_save else None,
+                'acc': test_acc,
+                'best_acc': best_acc,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+            }, is_best, args.out)
+
+            test_accs.append(test_acc)
+            logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
+            logger.info('Mean top-1 acc: {:.2f}\n'.format(
+                np.mean(test_accs[-20:])))
+
+    if args.local_rank in [-1, 0]:
+        args.writer.close()
 
 
 def test(args, test_loader, model, epoch):
