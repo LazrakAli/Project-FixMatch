@@ -310,6 +310,7 @@ def cutmix(images, labels, alpha=1.0):
     labels_b = labels[index]
 
     return mixed_images, labels_a, labels_b, lam
+
 def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
           model, optimizer, ema_model, scheduler):
     global best_acc
